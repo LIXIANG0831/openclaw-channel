@@ -14,10 +14,11 @@ load_dotenv(ENV_FILE)
 
 def load_config():
     """从配置文件和环境变量加载设置"""
+    config = {}
 
     # 环境变量覆盖配置文件
-    config["host"] = os.getenv("WS_HOST", config.get("host", "localhost"))
-    config["port"] = int(os.getenv("WS_PORT", config.get("port", 8765)))
+    config["host"] = os.getenv("WS_HOST", "localhost")
+    config["port"] = int(os.getenv("WS_PORT", "8765"))
     config["debug"] = os.getenv("DEBUG", "true").lower() == "true"
 
     return config
