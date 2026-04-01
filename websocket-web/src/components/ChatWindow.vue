@@ -28,22 +28,52 @@
         <div class="bubble">
           <!-- 工具调用卡片 -->
           <div v-if="msg.role === 'tool'" class="tool-card">
+            <!-- 头部：工具名称 + 状态 -->
             <div class="tool-header">
               <span class="tool-icon">🔧</span>
               <span class="tool-name">{{ msg.content.name || '工具调用' }}</span>
               <span class="tool-status" :class="msg.content.status">
-                {{ msg.content.status === 'running' ? '运行中...' : '已完成' }}
+                <span v-if="msg.content.status === 'starting'">启动中...</span>
+                <span v-else-if="msg.content.status === 'running'" class="status-running">
+                  <span class="spinner"></span>
+                  执行中
+                </span>
+                <span v-else-if="msg.content.status === 'completed'">✓ 已完成</span>
               </span>
             </div>
+
+            <!-- 命令信息 -->
             <div v-if="msg.content.command" class="tool-command">
+              <div class="command-label">命令:</div>
               <code>{{ msg.content.command }}</code>
             </div>
-            <div v-if="msg.content.result" class="tool-result">
-              <div class="result-label">输出:</div>
-              <pre>{{ msg.content.result }}</pre>
+
+            <!-- 工作目录和进程信息 -->
+            <div v-if="msg.content.cwd || msg.content.pid" class="tool-info">
+              <span v-if="msg.content.cwd" class="info-item">
+                📁 {{ msg.content.cwd }}
+              </span>
+              <span v-if="msg.content.pid" class="info-item">
+                🔢 PID: {{ msg.content.pid }}
+              </span>
             </div>
-            <div v-if="msg.content.exitCode !== undefined" class="tool-meta">
-              退出码: {{ msg.content.exitCode }} | 耗时: {{ msg.content.duration }}ms
+
+            <!-- 输出结果 -->
+            <div v-if="msg.content.output" class="tool-output">
+              <div class="output-label">
+                {{ msg.content.status === 'completed' ? '输出结果:' : '实时输出:' }}
+              </div>
+              <pre class="output-content">{{ msg.content.output }}</pre>
+            </div>
+
+            <!-- 元信息：退出码和耗时 -->
+            <div v-if="msg.content.status === 'completed'" class="tool-meta">
+              <span class="meta-item" :class="{ success: msg.content.exitCode === 0, error: msg.content.exitCode !== 0 }">
+                {{ msg.content.exitCode === 0 ? '✓ 成功' : `✗ 失败 (退出码: ${msg.content.exitCode})` }}
+              </span>
+              <span class="meta-item">
+                ⏱️ {{ msg.content.duration }}ms
+              </span>
             </div>
           </div>
           <!-- 普通消息 -->
@@ -266,54 +296,69 @@ const addSystemMessage = (content) => {
 const handleToolCallMessage = (data) => {
   const runId = data.runId;
 
-  // 1. 初始工具调用 - 创建新消息
+  // 1. 初始工具调用 (seq: 2) - 创建新消息
   if (data.seq && !data.partialResult && !data.result) {
     activeToolCalls[runId] = messages.length; // 记录消息索引
     addMessage('tool', {
       name: '命令执行',
+      status: 'starting',
       command: '',
-      status: 'running',
-      result: '',
+      output: '',
+      cwd: '',
+      pid: null,
       exitCode: undefined,
-      duration: 0
+      duration: 0,
+      startTime: Date.now()
     });
     return;
   }
 
-  // 2. 处理 partialResult (运行中更新)
+  // 2. 处理 partialResult (seq: 3, 执行中) - 流式更新
   if (data.partialResult) {
     const details = data.partialResult.details || {};
     const content = data.partialResult.content || [];
 
-    // 提取命令文本
-    const command = extractCommandFromContent(content);
-
     if (activeToolCalls[runId] !== undefined) {
       const msgIndex = activeToolCalls[runId];
       if (messages[msgIndex] && messages[msgIndex].role === 'tool') {
-        messages[msgIndex].content.status = details.status || 'running';
-        if (command) messages[msgIndex].content.command = command;
-        if (details.cwd) messages[msgIndex].content.cwd = details.cwd;
+        const toolContent = messages[msgIndex].content;
+
+        // 更新状态
+        toolContent.status = details.status || 'running';
+        toolContent.pid = details.pid || toolContent.pid;
+        toolContent.cwd = details.cwd || toolContent.cwd;
+
+        // 流式输出：使用 tail 获取实时输出
+        if (details.tail) {
+          toolContent.output = details.tail;
+        }
+
+        // 如果有命令内容
+        const command = extractCommandFromContent(content);
+        if (command) toolContent.command = command;
       }
     }
     return;
   }
 
-  // 3. 处理最终 result (完成)
+  // 3. 处理最终 result (seq: 4, 完成)
   if (data.result) {
     const details = data.result.details || {};
     const content = data.result.content || [];
 
-    // 提取结果文本
-    const resultText = extractTextFromContent(content);
+    // 提取完整结果
+    const resultText = details.aggregated || extractTextFromContent(content);
 
     if (activeToolCalls[runId] !== undefined) {
       const msgIndex = activeToolCalls[runId];
       if (messages[msgIndex] && messages[msgIndex].role === 'tool') {
-        messages[msgIndex].content.status = 'completed';
-        messages[msgIndex].content.result = resultText;
-        messages[msgIndex].content.exitCode = details.exitCode;
-        messages[msgIndex].content.duration = details.durationMs;
+        const toolContent = messages[msgIndex].content;
+
+        toolContent.status = 'completed';
+        toolContent.output = resultText;
+        toolContent.exitCode = details.exitCode;
+        toolContent.duration = details.durationMs;
+
         delete activeToolCalls[runId]; // 清理
       }
     } else {
@@ -321,7 +366,9 @@ const handleToolCallMessage = (data) => {
       addMessage('tool', {
         name: '命令执行',
         status: 'completed',
-        result: resultText,
+        command: '',
+        output: resultText,
+        cwd: details.cwd,
         exitCode: details.exitCode,
         duration: details.durationMs
       });
@@ -551,90 +598,158 @@ onUnmounted(() => {
 
 /* 工具调用卡片样式 */
 .tool-card {
-  min-width: 250px;
+  min-width: 280px;
 }
 
 .tool-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
-  padding-bottom: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
   border-bottom: 1px solid #e0e0e0;
 }
 
 .tool-icon {
-  font-size: 1.1rem;
+  font-size: 1.2rem;
 }
 
 .tool-name {
   font-weight: 600;
   color: #333;
   flex: 1;
+  font-size: 0.95rem;
 }
 
 .tool-status {
   font-size: 0.75rem;
-  padding: 2px 8px;
-  border-radius: 10px;
+  padding: 3px 10px;
+  border-radius: 12px;
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tool-status.starting {
+  background: #e3f2fd;
+  color: #1976d2;
 }
 
 .tool-status.running {
-  background: #fff3cd;
-  color: #856404;
+  background: #fff3e0;
+  color: #f57c00;
 }
 
 .tool-status.completed {
-  background: #d4edda;
-  color: #155724;
+  background: #e8f5e9;
+  color: #388e3c;
+}
+
+.status-running {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #f57c00;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .tool-command {
-  background: #f5f5f5;
-  padding: 8px 12px;
-  border-radius: 6px;
-  margin-bottom: 8px;
+  background: #f8f9fa;
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin-bottom: 10px;
   border-left: 3px solid #1967d2;
 }
 
+.command-label {
+  font-size: 0.7rem;
+  color: #666;
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
 .tool-command code {
-  font-family: 'Monaco', 'Menlo', monospace;
+  font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
   font-size: 0.85rem;
   color: #d63384;
   word-break: break-all;
 }
 
-.tool-result {
-  margin-top: 8px;
-}
-
-.result-label {
-  font-size: 0.75rem;
+.tool-info {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 0.8rem;
   color: #666;
-  margin-bottom: 4px;
 }
 
-.tool-result pre {
-  background: #f8f9fa;
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-family: 'Monaco', 'Menlo', monospace;
+.info-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tool-output {
+  margin-top: 10px;
+}
+
+.output-label {
+  font-size: 0.75rem;
+  color: #555;
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+.output-content {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 12px;
+  border-radius: 8px;
+  font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
   font-size: 0.85rem;
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 200px;
+  max-height: 300px;
   overflow-y: auto;
-  color: #333;
+  line-height: 1.5;
 }
 
 .tool-meta {
-  font-size: 0.7rem;
-  color: #888;
-  margin-top: 6px;
-  padding-top: 6px;
+  display: flex;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 10px;
   border-top: 1px solid #eee;
+  font-size: 0.75rem;
+}
+
+.meta-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.meta-item.success {
+  color: #388e3c;
+  font-weight: 500;
+}
+
+.meta-item.error {
+  color: #d32f2f;
+  font-weight: 500;
 }
 
 /* Markdown 渲染样式 */
