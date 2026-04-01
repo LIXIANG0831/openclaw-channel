@@ -16,17 +16,38 @@
         <p class="hint">后端：Python WebSocket Hub | AI：OpenClaw</p>
       </div>
 
-      <div 
-        v-for="(msg, index) in messages" 
-        :key="index" 
-        class="message-item" 
+      <div
+        v-for="(msg, index) in messages"
+        :key="index"
+        class="message-item"
         :class="msg.role"
       >
         <div class="avatar">
-          {{ msg.role === 'user' ? '🧑‍💻' : '🤖' }}
+          {{ msg.role === 'user' ? '🧑‍💻' : msg.role === 'tool' ? '⚙️' : '🤖' }}
         </div>
         <div class="bubble">
-          <div class="content">{{ msg.content }}</div>
+          <!-- 工具调用卡片 -->
+          <div v-if="msg.role === 'tool'" class="tool-card">
+            <div class="tool-header">
+              <span class="tool-icon">🔧</span>
+              <span class="tool-name">{{ msg.content.name || '工具调用' }}</span>
+              <span class="tool-status" :class="msg.content.status">
+                {{ msg.content.status === 'running' ? '运行中...' : '已完成' }}
+              </span>
+            </div>
+            <div v-if="msg.content.command" class="tool-command">
+              <code>{{ msg.content.command }}</code>
+            </div>
+            <div v-if="msg.content.result" class="tool-result">
+              <div class="result-label">输出:</div>
+              <pre>{{ msg.content.result }}</pre>
+            </div>
+            <div v-if="msg.content.exitCode !== undefined" class="tool-meta">
+              退出码: {{ msg.content.exitCode }} | 耗时: {{ msg.content.duration }}ms
+            </div>
+          </div>
+          <!-- 普通消息 -->
+          <div v-else class="content markdown-body" v-html="renderMarkdown(msg.content)"></div>
           <div class="timestamp">{{ msg.time }}</div>
         </div>
       </div>
@@ -65,6 +86,23 @@
 
 <script setup>
 import { ref, reactive, nextTick, computed, onMounted, onUnmounted } from 'vue';
+import { marked } from 'marked';
+import hljs from 'highlight.js';
+import 'highlight.js/styles/github-dark.css';
+
+// 配置 marked 使用 highlight.js
+marked.setOptions({
+  highlight: function(code, lang) {
+    if (lang && hljs.getLanguage(lang)) {
+      try {
+        return hljs.highlight(code, { language: lang }).value;
+      } catch (err) {}
+    }
+    return hljs.highlightAuto(code).value;
+  },
+  breaks: true,
+  gfm: true
+});
 
 // --- 状态定义 ---
 const inputMessage = ref('');
@@ -72,6 +110,7 @@ const messages = reactive([]);
 const isThinking = ref(false);
 const ws = ref(null);
 const messageListRef = ref(null);
+const activeToolCalls = reactive({}); // 存储进行中的工具调用
 
 // 连接状态: 'disconnected', 'connecting', 'connected'
 const connectionStatus = ref('disconnected');
@@ -109,20 +148,29 @@ const connectWebSocket = () => {
   ws.value.onmessage = (event) => {
     try {
       const packet = JSON.parse(event.data);
-      
+
       // 【核心协议】处理来自 OpenClaw 的转发消息
       if (packet.type === 'from_openclaw') {
         // 停止思考动画
         isThinking.value = false;
-        
-        // 提取内容：兼容多种数据结构
-        const content = packet.data?.content 
-                     || packet.data?.text 
-                     || packet.data?.reply 
-                     || JSON.stringify(packet.data);
-        
-        addMessage('ai', content);
-      } 
+
+        // 检查是否是工具调用消息
+        if (packet.data?.type === 'tool_call') {
+          handleToolCallMessage(packet.data.data);
+        } else {
+          // 提取内容：兼容多种数据结构
+          const content = packet.data?.content
+                       || packet.data?.text
+                       || packet.data?.reply
+                       || JSON.stringify(packet.data);
+
+          addMessage('ai', content);
+        }
+      }
+      // 处理工具调用消息
+      else if (packet.type === 'tool_call') {
+        handleToolCallMessage(packet.data);
+      }
       // 处理错误消息
       else if (packet.type === 'error') {
         addSystemMessage(`⚠️ 服务器错误: ${packet.message}`);
@@ -137,7 +185,7 @@ const connectWebSocket = () => {
         addMessage('ai', event.data);
         isThinking.value = false;
       }
-      
+
       scrollToBottom();
     } catch (e) {
       console.error('解析消息失败:', e);
@@ -212,6 +260,99 @@ const addSystemMessage = (content) => {
     content,
     time: new Date().toLocaleTimeString()
   });
+};
+
+// 处理工具调用消息
+const handleToolCallMessage = (data) => {
+  const runId = data.runId;
+
+  // 1. 初始工具调用 - 创建新消息
+  if (data.seq && !data.partialResult && !data.result) {
+    activeToolCalls[runId] = messages.length; // 记录消息索引
+    addMessage('tool', {
+      name: '命令执行',
+      command: '',
+      status: 'running',
+      result: '',
+      exitCode: undefined,
+      duration: 0
+    });
+    return;
+  }
+
+  // 2. 处理 partialResult (运行中更新)
+  if (data.partialResult) {
+    const details = data.partialResult.details || {};
+    const content = data.partialResult.content || [];
+
+    // 提取命令文本
+    const command = extractCommandFromContent(content);
+
+    if (activeToolCalls[runId] !== undefined) {
+      const msgIndex = activeToolCalls[runId];
+      if (messages[msgIndex] && messages[msgIndex].role === 'tool') {
+        messages[msgIndex].content.status = details.status || 'running';
+        if (command) messages[msgIndex].content.command = command;
+        if (details.cwd) messages[msgIndex].content.cwd = details.cwd;
+      }
+    }
+    return;
+  }
+
+  // 3. 处理最终 result (完成)
+  if (data.result) {
+    const details = data.result.details || {};
+    const content = data.result.content || [];
+
+    // 提取结果文本
+    const resultText = extractTextFromContent(content);
+
+    if (activeToolCalls[runId] !== undefined) {
+      const msgIndex = activeToolCalls[runId];
+      if (messages[msgIndex] && messages[msgIndex].role === 'tool') {
+        messages[msgIndex].content.status = 'completed';
+        messages[msgIndex].content.result = resultText;
+        messages[msgIndex].content.exitCode = details.exitCode;
+        messages[msgIndex].content.duration = details.durationMs;
+        delete activeToolCalls[runId]; // 清理
+      }
+    } else {
+      // 如果没有找到之前的消息，创建新的
+      addMessage('tool', {
+        name: '命令执行',
+        status: 'completed',
+        result: resultText,
+        exitCode: details.exitCode,
+        duration: details.durationMs
+      });
+    }
+  }
+};
+
+// 从 content 数组中提取命令
+const extractCommandFromContent = (content) => {
+  if (!Array.isArray(content)) return '';
+  for (const item of content) {
+    if (item.type === 'text' && item.text) {
+      return item.text;
+    }
+  }
+  return '';
+};
+
+// 从 content 数组中提取文本结果
+const extractTextFromContent = (content) => {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(item => item.type === 'text' && item.text)
+    .map(item => item.text)
+    .join('\n');
+};
+
+// 渲染 Markdown
+const renderMarkdown = (text) => {
+  if (typeof text !== 'string') return '';
+  return marked.parse(text);
 };
 
 const scrollToBottom = () => {
@@ -406,5 +547,187 @@ onUnmounted(() => {
 }
 .control-btn:hover {
   background: #eee;
+}
+
+/* 工具调用卡片样式 */
+.tool-card {
+  min-width: 250px;
+}
+
+.tool-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.tool-icon {
+  font-size: 1.1rem;
+}
+
+.tool-name {
+  font-weight: 600;
+  color: #333;
+  flex: 1;
+}
+
+.tool-status {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 500;
+}
+
+.tool-status.running {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.tool-status.completed {
+  background: #d4edda;
+  color: #155724;
+}
+
+.tool-command {
+  background: #f5f5f5;
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  border-left: 3px solid #1967d2;
+}
+
+.tool-command code {
+  font-family: 'Monaco', 'Menlo', monospace;
+  font-size: 0.85rem;
+  color: #d63384;
+  word-break: break-all;
+}
+
+.tool-result {
+  margin-top: 8px;
+}
+
+.result-label {
+  font-size: 0.75rem;
+  color: #666;
+  margin-bottom: 4px;
+}
+
+.tool-result pre {
+  background: #f8f9fa;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-family: 'Monaco', 'Menlo', monospace;
+  font-size: 0.85rem;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  color: #333;
+}
+
+.tool-meta {
+  font-size: 0.7rem;
+  color: #888;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid #eee;
+}
+
+/* Markdown 渲染样式 */
+.markdown-body {
+  line-height: 1.6;
+}
+
+.markdown-body p {
+  margin: 0 0 8px 0;
+}
+
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Menlo', monospace;
+  font-size: 0.9em;
+}
+
+.message-item.user .markdown-body code {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.markdown-body pre {
+  background: #24292e;
+  color: #f6f8fa;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.markdown-body ul, .markdown-body ol {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+
+.markdown-body li {
+  margin: 4px 0;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  margin: 12px 0 8px 0;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.markdown-body h1 { font-size: 1.3em; }
+.markdown-body h2 { font-size: 1.2em; }
+.markdown-body h3 { font-size: 1.1em; }
+
+.markdown-body blockquote {
+  border-left: 4px solid #dfe2e5;
+  padding-left: 12px;
+  margin: 8px 0;
+  color: #6a737d;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  width: 100%;
+}
+
+.markdown-body th, .markdown-body td {
+  border: 1px solid #dfe2e5;
+  padding: 6px 12px;
+}
+
+.markdown-body th {
+  background: #f6f8fa;
+  font-weight: 600;
+}
+
+.markdown-body a {
+  color: #1967d2;
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
 }
 </style>
