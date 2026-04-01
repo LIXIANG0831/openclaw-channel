@@ -167,6 +167,32 @@ const WebSocketChannel = {
 
       connections.set(account.accountId, { ws, accountId: account.accountId });
 
+      // === 订阅工具调用事件 ===
+      const unsubscribeAgentEvent = runtime.events.onAgentEvent((evt) => {
+        // 只处理工具调用事件
+        if (evt.stream !== "tool") return;
+
+        const toolData = evt.data;
+        log?.info(`[websocket-channel] Tool called: ${toolData?.tool}`);
+
+        // 通过 WebSocket 发送给客户端
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({
+            type: "tool_call",
+            data: {
+              tool: toolData?.tool,
+              input: toolData?.input,
+              result: toolData?.result,
+              partialResult: toolData?.partialResult,
+              runId: evt.runId,
+              sessionKey: evt.sessionKey,
+              seq: evt.seq,
+            }
+          }));
+        }
+      });
+      // ===========================
+
       const connectionPromise = new Promise((resolve, reject) => {
         ws.on("open", () => {
           log?.info(`[websocket-channel] Connected to ${account.wsUrl}`);
@@ -251,12 +277,14 @@ const WebSocketChannel = {
 
         ws.on("close", () => {
           log?.info(`[websocket-channel] Connection closed`);
+          unsubscribeAgentEvent();
           connections.delete(account.accountId);
           resolve();
         });
 
         abortSignal.addEventListener("abort", () => {
           log?.info(`[websocket-channel] Abort requested`);
+          unsubscribeAgentEvent();
           ws.close();
           resolve();
         });
