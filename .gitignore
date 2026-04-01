@@ -4,4 +4,5 @@
 .env.local
 openclaw.config.json
 .DS_Store
-*/.idea
+.idea/
+*.iml
